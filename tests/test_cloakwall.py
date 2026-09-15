@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """
-Cloakwall Core Test Suite (Stdlib-Only)
-No third-party runner or framework dependencies. Run with: python3 tests/test_cloakwall.py
+Cloakwall test suite.  python3 tests/test_cloakwall.py
+
+No pytest dependency on purpose: someone evaluating this in a locked-down
+environment should be able to run the tests with nothing but python3.
 """
 
+import asyncio
 import json
 import os
 import sys
@@ -11,8 +14,9 @@ import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from cloakwall.redact import Redactor
 from cloakwall.audit import AuditLog
+from cloakwall.guardrail import Cloakwall
+from cloakwall.redact import Redactor, _luhn, _nhs
 
 PASS = FAIL = 0
 
@@ -27,118 +31,169 @@ def check(name, got, want):
         print(f"  FAIL  {name}\n          got  {got!r}\n          want {want!r}")
 
 
-def safe_redact(r_obj, payload):
-    """Safely redact strings, nested dicts, lists, and unwrap Result objects."""
-    if isinstance(payload, str):
-        res = r_obj.redact(payload)
-        return res.text if hasattr(res, "text") else res
-    elif isinstance(payload, dict):
-        return {k: safe_redact(r_obj, v) for k, v in payload.items()}
-    elif isinstance(payload, list):
-        return [safe_redact(r_obj, item) for item in payload]
-    return payload
+def section(t):
+    print(f"\n{t}")
 
 
-def safe_audit_log(audit_obj, event, payload):
-    """Safely inspect and invoke the logging method on AuditLog."""
-    for method_name in ["record", "write", "log", "append", "emit", "audit", "record_event", "log_event"]:
-        if hasattr(audit_obj, method_name):
-            func = getattr(audit_obj, method_name)
-            try:
-                return func(event, payload)
-            except TypeError:
-                try:
-                    return func({"event": event, **payload})
-                except TypeError:
-                    try:
-                        return func(f"{event}: {payload}")
-                    except Exception:
-                        pass
+# ---------------------------------------------------------------- detection
+section("Detection")
+r = Redactor(mode="mask", secret=b"test")
+check("email", r.redact("write to a.b+c@x.co.uk now").text, "write to <EMAIL> now")
+check("valid card redacted", r.redact("card 4111111111111111").text, "card <CARD>")
+check("invalid card left alone", r.redact("order 1234567890123456").text,
+      "order 1234567890123456")
+check("ssn", r.redact("ssn 123-45-6789").text, "ssn <SSN>")
+check("aws key", r.redact("AKIAIOSFODNN7EXAMPLE").text, "<AWS_KEY>")
+check("sri lankan phone", r.redact("call +94 77 123 4567").text, "call <PHONE>")
+check("us phone is PHONE not NHS", r.redact("call 555-867-5309").text, "call <PHONE>")
+check("real nhs number", r.redact("nhs 943 476 5919").text, "nhs <NHS>")
+check("clean text untouched", r.redact("the quick brown fox").text,
+      "the quick brown fox")
 
+# ---------------------------------------------------------------- validators
+section("Validators")
+check("luhn accepts real card", _luhn("4111111111111111"), True)
+check("luhn rejects sequence", _luhn("1234567890123456"), False)
+check("nhs accepts valid", _nhs("9434765919"), True)
+check("nhs rejects phone", _nhs("5558675309"), False)
 
-print("\n--- Cloakwall Core Engine Suite (Stdlib-Only) ---")
+# ---------------------------------------------------------------- modes
+section("Redaction modes")
+check("hash is deterministic",
+      Redactor(mode="hash", secret=b"k").redact("a@b.com").text
+      == Redactor(mode="hash", secret=b"k").redact("a@b.com").text, True)
+check("hash differs under another secret",
+      Redactor(mode="hash", secret=b"k1").redact("a@b.com").text
+      != Redactor(mode="hash", secret=b"k2").redact("a@b.com").text, True)
+check("partial keeps card tail",
+      Redactor(mode="partial").redact("4111111111111111").text, "<CARD:****1111>")
 
-# --- Section 1: Basic Redactor Unit Tests ---
-r = Redactor(mode="mask", secret=b"test-secret")
+# ---------------------------------------------------------------- overlaps
+section("Overlapping spans")
+out = r.redact("bob@x.com 4111111111111111 123-45-6789")
+check("three distinct entities", sorted(out.counts), ["CARD", "EMAIL", "SSN"])
+check("no nested tokens", "<<" in out.text, False)
 
-check("Redactor initialization", isinstance(r, Redactor), True)
-check("SSN Redaction", safe_redact(r, "User SSN is 123-45-6789"), "User SSN is <SSN>")
-check("Credit Card Redaction", safe_redact(r, "Card: 4111-1111-1111-1111"), "Card: <CARD>")
-check("Email Redaction", safe_redact(r, "Email me at test@example.com"), "Email me at <EMAIL>")
-check("IPv4 Address Redaction", safe_redact(r, "IP: 192.168.1.1"), "IP: <IPV4>")
-check("Clean Text Pass-Through", safe_redact(r, "Hello World"), "Hello World")
-check("Empty String Handling", safe_redact(r, ""), "")
-
-# --- Section 2: Hash Mode Tests ---
-r_hash = Redactor(mode="hash", secret=b"test-secret")
-check("SSN Hash Redaction", "<SSN:" in safe_redact(r_hash, "123-45-6789"), True)
-check("Email Hash Redaction", "<EMAIL:" in safe_redact(r_hash, "user@domain.com"), True)
-
-# --- Section 3: Nested Data Structure & JSON Redaction ---
-nested_payload = {
-    "user": {
-        "email": "dev@cloakwall.ai",
-        "details": {
-            "ssn": "123-45-6789",
-            "bio": "Nothing secret here"
-        }
-    },
-    "logs": ["Safe log", "Leaked IP: 10.0.0.1"]
-}
-
-redacted_struct = safe_redact(r, nested_payload)
-check("Nested Email Redacted", redacted_struct["user"]["email"], "<EMAIL>")
-check("Nested SSN Redacted", redacted_struct["user"]["details"]["ssn"], "<SSN>")
-check("Nested Clean Bio Kept", redacted_struct["user"]["details"]["bio"], "Nothing secret here")
-check("List Item IP Redacted", redacted_struct["logs"][1], "Leaked IP: <IPV4>")
-
-# --- Section 4: Tool Arguments & Structured AI Call Redaction ---
-tool_payload = {
-    "role": "assistant",
-    "tool_calls": [
-        {
-            "function": {
-                "name": "lookup_user",
-                "arguments": '{"email": "john@doe.com", "card": "4111111111111111"}'
-            }
-        }
-    ]
-}
-
-redacted_tool = safe_redact(r, tool_payload)
-args_redacted = json.loads(redacted_tool["tool_calls"][0]["function"]["arguments"])
-check("Tool Args JSON Email Redacted", args_redacted["email"], "<EMAIL>")
-check("Tool Args JSON Card Redacted", args_redacted["card"], "<CARD>")
-
-# --- Section 5: Truncation Resistance & Malformed Input Boundary Tests ---
-check("Partial Pattern Non-Match", safe_redact(r, "SSN: 123-45"), "SSN: 123-45")
-check("Malformed JSON String Fallback", safe_redact(r, "{bad_json: 123-45-6789}"), "{bad_json: <SSN>}")
-check("Large Payload Boundary", len(safe_redact(r, "A" * 10000 + " 123-45-6789")), 10000 + len(" <SSN>"))
-
-# --- Section 6: Audit Chain Logging Tests ---
+# ---------------------------------------------------------------- audit
+section("Audit chain")
 with tempfile.TemporaryDirectory() as d:
-    log_file = os.path.join(d, "audit.log")
-    audit = AuditLog(log_file)
-    
-    safe_audit_log(audit, "test.event", {"user": "admin", "status": "ok"})
-    check("Audit File Creation", os.path.exists(log_file), True)
-    
-    log_content = open(log_file).read() if os.path.exists(log_file) else ""
-    check("Audit Event Recorded", len(log_content) > 0 or os.path.exists(log_file), True)
+    log = AuditLog(os.path.join(d, "a.log"))
+    for i in range(5):
+        log.append("test.event", n=i)
+    check("intact chain verifies", log.verify()[0], True)
 
-# --- Section 7: Strict Validation Boundary Checks ---
-check("Non-String Input Safety", safe_redact(r, 12345), 12345)
-check("Boolean Input Safety", safe_redact(r, True), True)
-check("None Input Safety", safe_redact(r, None), None)
-check("Empty List Safety", safe_redact(r, []), [])
+    lines = open(log.path).read().splitlines()
+    e = json.loads(lines[2]); e["n"] = 99
+    lines[2] = json.dumps(e, sort_keys=True)
+    open(log.path, "w").write("\n".join(lines) + "\n")
+    ok, msg = log.verify()
+    check("tampered entry detected", ok, False)
+    check("names the right line", msg, "line 3: entry altered after writing")
 
-# --- Section 8: Multi-Pattern Combination & Stress Boundaries ---
-combo_text = "Contact john@test.com or 123-45-6789 using IP 192.168.0.1"
-expected_combo = "Contact <EMAIL> or <SSN> using IP <IPV4>"
-check("Multi-Entity String Redaction", safe_redact(r, combo_text), expected_combo)
+with tempfile.TemporaryDirectory() as d:
+    log = AuditLog(os.path.join(d, "b.log"))
+    for i in range(5):
+        log.append("test.event", n=i)
+    lines = open(log.path).read().splitlines()
+    del lines[2]
+    open(log.path, "w").write("\n".join(lines) + "\n")
+    check("deleted entry detected", log.verify()[0], False)
 
-for i in range(1, 13):
-    check(f"Core Engine Validation Spec #{i}", safe_redact(r, f"spec_{i}_clean_val"), f"spec_{i}_clean_val")
+section("Truncation resistance")
+with tempfile.TemporaryDirectory() as d:
+    log = AuditLog(os.path.join(d, "t.log"))
+    for i in range(10):
+        log.append("test.event", n=i)
+    anchor = log.read_anchor()
+    check("anchor records entry count", anchor["seq"], 10)
+    check("intact log matches anchor", log.verify()[0], True)
+
+    lines = open(log.path).read().splitlines()[:6]
+    open(log.path, "w").write("\n".join(lines) + "\n")
+    ok, msg = log.verify(anchor=anchor)
+    check("end-truncation detected", ok, False)
+    check("reports the shortfall", "anchor records 10" in msg, True)
+
+with tempfile.TemporaryDirectory() as d:
+    log = AuditLog(os.path.join(d, "s.log"))
+    for i in range(5):
+        log.append("e", n=i)
+    seqs = [json.loads(l)["seq"] for l in open(log.path) if l.strip()]
+    check("sequence numbers are contiguous", seqs, [1, 2, 3, 4, 5])
+
+# ---------------------------------------------------------------- guardrail
+section("Guardrail hook")
+
+
+class Key:
+    key_alias = "team-a"
+    team_id = "t1"
+
+
+async def guardrail_tests():
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "g.log")
+        g = Cloakwall(redaction_mode="mask", audit_path=path)
+
+        data = {"model": "m", "messages": [
+            {"role": "user", "content": "card 4111111111111111 mail z@y.com"}]}
+        out = await g.async_pre_call_hook(Key(), None, data, "acompletion")
+        check("request redacted in place",
+              out["messages"][0]["content"], "card <CARD> mail <EMAIL>")
+
+        raw = open(path).read()
+        check("card absent from audit log", "4111111111111111" in raw, False)
+        check("email absent from audit log", "z@y.com" in raw, False)
+        check("entity counts recorded", '"CARD": 1' in raw, True)
+
+        await g.async_pre_call_hook(
+            Key(), None,
+            {"model": "m", "messages": [{"role": "user", "content": "hello"}]},
+            "acompletion")
+        check("clean request logs nothing extra",
+              len([l for l in open(path) if l.strip()]), 1)
+
+        multimodal = {"model": "m", "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "ssn 123-45-6789"},
+            {"type": "image_url", "image_url": {"url": "http://x/y.png"}}]}]}
+        out = await g.async_pre_call_hook(Key(), None, multimodal, "acompletion")
+        parts = out["messages"][0]["content"]
+        check("multimodal text redacted", parts[0]["text"], "ssn <SSN>")
+        check("multimodal image untouched", parts[1]["type"], "image_url")
+
+        out = await g.async_pre_call_hook(
+            Key(), None, {"model": "m"}, "acompletion")
+        check("request with no messages survives", out, {"model": "m"})
+
+        check("stats report intact chain", g.stats()["audit_intact"], True)
+
+        tc = {"model": "m", "messages": [{"role": "assistant", "tool_calls": [
+            {"id": "c1", "type": "function", "function": {
+                "name": "lookup",
+                "arguments": '{"card":"4111111111111111","mail":"a@b.com"}'}}]}]}
+        out = await g.async_pre_call_hook(Key(), None, tc, "acompletion")
+        args = out["messages"][0]["tool_calls"][0]["function"]["arguments"]
+        check("tool-call arguments redacted", args,
+              '{"card":"<CARD>","mail":"<EMAIL>"}')
+
+    with tempfile.TemporaryDirectory() as d:
+        b = Cloakwall(audit_path=os.path.join(d, "b.log"), block_on=["CARD"])
+        blocked = False
+        try:
+            await b.async_pre_call_hook(Key(), None, {"model": "m", "messages": [
+                {"role": "user", "content": "card 4111111111111111"}]}, "acompletion")
+        except ValueError:
+            blocked = True
+        check("block_on rejects the request", blocked, True)
+
+        ok = await b.async_pre_call_hook(Key(), None, {"model": "m", "messages": [
+            {"role": "user", "content": "mail a@b.com"}]}, "acompletion")
+        check("non-blocked entity still redacted",
+              ok["messages"][0]["content"], "mail <EMAIL>")
+        check("block counted in stats", b.stats()["requests_blocked"], 1)
+
+
+asyncio.run(guardrail_tests())
 
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)
